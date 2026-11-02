@@ -19,6 +19,8 @@ import (
 // the client-authentication strategy.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Must equal server.TokenEndpointPath. This package cannot import
+		// package server, which imports it.
 		if r.URL.Path != "/oauth/token" || r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 			next.ServeHTTP(w, r)
 			return
