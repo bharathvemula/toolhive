@@ -6,7 +6,9 @@ package tokenexchange
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,18 +47,25 @@ func (c *recordingAssertionConsumer) ConsumeAssertionJWT(
 	return c.err
 }
 
-func idJAGResolvedIssuers(t *testing.T) []TrustedIssuer {
+func idJAGResolvedIssuers(t *testing.T, issuerURLs ...string) []TrustedIssuer {
 	t.Helper()
-	resolved, err := ResolveJWTBearerGrantPolicies([]TrustedIssuer{{
-		IssuerURL:              idJAGTestIssuer,
-		AllowedDelegateClients: []string{anyDelegateClient},
-		JWTBearerGrant: &JWTBearerGrantPolicy{
-			MaxAssertionAge: time.Hour.String(),
-			SubjectBindings: []JWTBearerSubjectBinding{
-				{Subject: idJAGTestSubject, AllowedResources: []string{idJAGTestResource}},
+	if len(issuerURLs) == 0 {
+		issuerURLs = []string{idJAGTestIssuer}
+	}
+	trusted := make([]TrustedIssuer, 0, len(issuerURLs))
+	for _, issuerURL := range issuerURLs {
+		trusted = append(trusted, TrustedIssuer{
+			IssuerURL:              issuerURL,
+			AllowedDelegateClients: []string{anyDelegateClient},
+			JWTBearerGrant: &JWTBearerGrantPolicy{
+				MaxAssertionAge: time.Hour.String(),
+				SubjectBindings: []JWTBearerSubjectBinding{
+					{Subject: idJAGTestSubject, AllowedResources: []string{idJAGTestResource}},
+				},
 			},
-		},
-	}})
+		})
+	}
+	resolved, err := ResolveJWTBearerGrantPolicies(trusted)
 	require.NoError(t, err)
 	return resolved
 }
@@ -449,4 +458,221 @@ func TestIDJAGIssuanceFactory_RequiresSharedValidator(t *testing.T) {
 	_, err := IDJAGIssuanceFactory(idJAGResolvedIssuers(t), nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "shared validator")
+}
+
+const idJAGTestASIssuer = "https://as.example.com"
+
+// newIDJAGDepartureHandler builds a handler whose AS issuer identifier is
+// asIssuer and whose departure lines go to the returned buffer. The logger is
+// handler-local, so the process-wide default logger is untouched and tests
+// stay parallel.
+func newIDJAGDepartureHandler(
+	t *testing.T, claims *ValidatedClaims, asIssuer string, trustedIssuerURLs ...string,
+) (*IDJAGHandler, *recordingAssertionConsumer, *strings.Builder) {
+	t.Helper()
+	consumer := &recordingAssertionConsumer{}
+	handler, err := newIDJAGIssuanceHandler(
+		&testJWTBearerAssertionValidator{claims: claims},
+		testTokenEndpoint,
+		consumer,
+		&fosite.Config{
+			AccessTokenIssuer:        asIssuer,
+			AccessTokenLifespan:      time.Hour,
+			AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
+		},
+		&mockAccessTokenStrategy{},
+		&mockAccessTokenStorage{},
+		idJAGResolvedIssuers(t, trustedIssuerURLs...),
+		nil,
+	)
+	require.NoError(t, err)
+	var buf strings.Builder
+	handler.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return handler, consumer, &buf
+}
+
+func logLinesAt(out *strings.Builder, level string) []string {
+	var lines []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.Contains(line, "level="+level+" ") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func TestIDJAGHandler_LogsDraftDepartures(t *testing.T) {
+	t.Parallel()
+
+	const otherResource = "https://other.example.com"
+	tests := []struct {
+		name     string
+		asIssuer string
+		audience []string
+		resource any // the resource claim; nil leaves it out
+		want     []draftDeparture
+	}{
+		{
+			name:     "conforming ID-JAG logs nothing",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer},
+			resource: idJAGTestResource,
+		},
+		{
+			name:     "absent resource claim is not a departure",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer},
+		},
+		{
+			name:     "two audiences",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer, testTokenEndpoint},
+			want:     []draftDeparture{departureMultipleAudiences},
+		},
+		{
+			name:     "audience is the token endpoint only",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{testTokenEndpoint},
+			want:     []draftDeparture{departureAudienceNotIssuer},
+		},
+		{
+			name:     "unknown AS issuer skips the audience check",
+			audience: []string{testTokenEndpoint},
+		},
+		{
+			name:     "resource claim does not contain the requested resource",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer},
+			resource: []any{otherResource},
+			want:     []draftDeparture{departureResourceNotCovered},
+		},
+		{
+			name:     "array with a non-string element still misses the requested resource",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer},
+			resource: []any{otherResource, 42},
+			want:     []draftDeparture{departureResourceNotCovered},
+		},
+		{
+			name:     "array with a non-string element still covers the requested resource",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer},
+			resource: []any{idJAGTestResource, 42},
+		},
+		{
+			name:     "malformed resource claim is ignored",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{idJAGTestASIssuer},
+			resource: 42,
+		},
+		{
+			name:     "every departure at once",
+			asIssuer: idJAGTestASIssuer,
+			audience: []string{testTokenEndpoint, otherResource},
+			resource: otherResource,
+			want: []draftDeparture{
+				departureMultipleAudiences, departureAudienceNotIssuer, departureResourceNotCovered,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tj := newTestJWKS(t)
+			claims := validIDJAGClaims()
+			claims.Audience = tt.audience
+			if tt.resource != nil {
+				claims.Extra["resource"] = tt.resource
+			}
+			h, consumer, out := newIDJAGDepartureHandler(t, claims, tt.asIssuer)
+
+			redeem := func() {
+				req := newIDJAGRequest(t, tj, idJAGTestClientID)
+				require.NoError(t, h.HandleTokenEndpointRequest(t.Context(), req))
+				// The outcome is the one an unlogged redemption produces.
+				assert.Equal(t, fosite.Arguments{idJAGTestResource}, req.GetGrantedAudience())
+				issued, ok := req.GetSession().(*session.Session)
+				require.True(t, ok)
+				assert.Equal(t, idJAGTestIssuer+"#"+idJAGTestSubject, issued.GetSubject())
+				assert.Equal(t, claims.JWTID, consumer.key)
+			}
+
+			redeem()
+			warns := logLinesAt(out, "WARN")
+			require.Len(t, warns, len(tt.want))
+			for i, finding := range tt.want {
+				assert.Contains(t, warns[i], "finding="+string(finding))
+				assert.Contains(t, warns[i], "issuer="+idJAGTestIssuer)
+				assert.Contains(t, warns[i], "client_id="+idJAGTestClientID)
+			}
+			assert.Empty(t, logLinesAt(out, "DEBUG"))
+
+			// The same issuer and finding again is only a Debug line.
+			redeem()
+			assert.Len(t, logLinesAt(out, "WARN"), len(tt.want))
+			assert.Len(t, logLinesAt(out, "DEBUG"), len(tt.want))
+
+			for _, secret := range []string{
+				idJAGTestSubject, claims.JWTID, testTokenEndpoint, idJAGTestASIssuer, idJAGTestResource, otherResource,
+			} {
+				assert.NotContains(t, out.String(), secret)
+			}
+		})
+	}
+}
+
+func TestIDJAGHandler_RefusedRedemptionLogsNoDeparture(t *testing.T) {
+	t.Parallel()
+
+	claims := validIDJAGClaims()
+	claims.Audience = []string{testTokenEndpoint}
+	h, consumer, out := newIDJAGDepartureHandler(t, claims, idJAGTestASIssuer)
+	req := newIDJAGRequest(t, newTestJWKS(t), idJAGTestClientID)
+	req.Client = &fosite.DefaultClient{ID: idJAGTestClientID, Audience: []string{"https://other.example.com"}}
+
+	err := h.HandleTokenEndpointRequest(t.Context(), req)
+
+	require.ErrorIs(t, err, server.ErrInvalidTarget)
+	assert.Empty(t, consumer.key)
+	assert.Empty(t, out.String())
+}
+
+func TestIDJAGHandler_WarnOnceKeyIsIssuerAndFinding(t *testing.T) {
+	t.Parallel()
+
+	const (
+		issuerA = idJAGTestIssuer
+		issuerB = "https://idp-b.example.com"
+	)
+	// The same validator claims are changed between redemptions.
+	claims := validIDJAGClaims()
+	h, _, out := newIDJAGDepartureHandler(t, claims, idJAGTestASIssuer, issuerA, issuerB)
+	tj := newTestJWKS(t)
+
+	redeem := func(issuer, jti string, audience []string) {
+		claims.Issuer = issuer
+		claims.JWTID = jti
+		claims.Audience = audience
+		require.NoError(t, h.HandleTokenEndpointRequest(t.Context(), newIDJAGRequest(t, tj, idJAGTestClientID)))
+	}
+	notIssuer := []string{testTokenEndpoint}                       // finding X: audience_not_issuer
+	twoAudiences := []string{idJAGTestASIssuer, testTokenEndpoint} // finding Y: multiple_audiences
+
+	redeem(issuerA, "jti-1", notIssuer)
+	require.Len(t, logLinesAt(out, "WARN"), 1)
+	assert.Contains(t, logLinesAt(out, "WARN")[0], "issuer="+issuerA)
+
+	redeem(issuerB, "jti-2", notIssuer)
+	require.Len(t, logLinesAt(out, "WARN"), 2)
+	assert.Contains(t, logLinesAt(out, "WARN")[1], "issuer="+issuerB)
+
+	redeem(issuerA, "jti-3", twoAudiences)
+	require.Len(t, logLinesAt(out, "WARN"), 3)
+	assert.Contains(t, logLinesAt(out, "WARN")[2], "finding="+string(departureMultipleAudiences))
+	assert.Empty(t, logLinesAt(out, "DEBUG"))
+
+	redeem(issuerA, "jti-4", notIssuer)
+	assert.Len(t, logLinesAt(out, "WARN"), 3)
+	require.Len(t, logLinesAt(out, "DEBUG"), 1)
+	assert.Contains(t, logLinesAt(out, "DEBUG")[0], "finding="+string(departureAudienceNotIssuer))
 }

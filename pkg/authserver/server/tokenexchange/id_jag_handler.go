@@ -6,7 +6,9 @@ package tokenexchange
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/ory/fosite"
@@ -41,10 +43,13 @@ const idJAGReplayPurpose = "id-jag"
 // connection — so this handler never skips client authentication
 // (CanSkipClientAuth) and requires the authenticated client to be that
 // client. Confidential clients authenticate fully; a public client is
-// identified by client_id, which is sufficient binding here because the
-// assertion itself is the primary credential: single-use (required jti),
-// short-lived (maxAssertionAge), and audience-pinned to this server
-// (acceptedAudiences). The plain handler's synthetic client is not needed —
+// identified by client_id, which is accepted here because the assertion
+// itself is the primary credential: single-use (required jti), short-lived
+// (maxAssertionAge), and audience-pinned to this server (acceptedAudiences).
+// Draft §4.4 does not allow this: it requires client authentication or a
+// sender-constrained ID-JAG. This is a known departure that is not logged;
+// see the departures paragraph in docs/arch/17-token-exchange-delegation.md.
+// The plain handler's synthetic client is not needed —
 // the redeeming client is a real registered one.
 //
 // The redeeming client's registered grant_types metadata is deliberately not
@@ -68,7 +73,29 @@ type IDJAGHandler struct {
 	// explicitGrantClients holds the IDs of clients that must list the
 	// jwt-bearer grant in their registered grant types.
 	explicitGrantClients map[string]struct{}
+
+	// issuer supplies this authorization server's issuer identifier, the same
+	// value the server's own token validator uses (fosite.Config
+	// AccessTokenIssuer).
+	issuer fosite.AccessTokenIssuerProvider
+
+	// logger receives the draft-departure lines; nil means slog.Default().
+	logger *slog.Logger
+
+	// warned records the (assertion issuer, finding) pairs already logged at
+	// Warn. Its size is bounded by the trusted issuers times the findings.
+	warned sync.Map
 }
+
+// draftDeparture names a way an accepted ID-JAG departs from draft-ietf-oauth-
+// identity-assertion-authz-grant-06 Section 4.4.1.
+type draftDeparture string
+
+const (
+	departureMultipleAudiences  draftDeparture = "multiple_audiences"
+	departureAudienceNotIssuer  draftDeparture = "audience_not_issuer"
+	departureResourceNotCovered draftDeparture = "resource_not_covered"
+)
 
 // newIDJAGIssuanceHandler constructs the production bound handler over the
 // same issuance core as newJWTBearerIssuanceHandler; see that constructor
@@ -87,7 +114,7 @@ func newIDJAGIssuanceHandler(
 	for _, id := range explicitGrantClientIDs {
 		explicitGrantClients[id] = struct{}{}
 	}
-	return &IDJAGHandler{core: core, explicitGrantClients: explicitGrantClients}, nil
+	return &IDJAGHandler{core: core, explicitGrantClients: explicitGrantClients, issuer: config}, nil
 }
 
 // CanHandleTokenEndpointRequest claims only recognized ID-JAG assertions —
@@ -147,6 +174,7 @@ func (h *IDJAGHandler) HandleTokenEndpointRequest(ctx context.Context, requester
 		resource, requester.GetClient(), h.core.config.GetAudienceStrategy(ctx)); err != nil {
 		return err
 	}
+	h.logDraftDepartures(ctx, claims, requester.GetClient().GetID(), resource)
 	// Consume before issuing — fails closed like the plain handler: if
 	// issuance fails past this point the assertion stays consumed rather
 	// than becoming replayable.
@@ -191,6 +219,39 @@ func (h *IDJAGHandler) PopulateTokenEndpointResponse(
 		return errorsx.WithStack(fosite.ErrUnknownRequest)
 	}
 	return h.core.populateAccessTokenResponse(ctx, requester, responder)
+}
+
+// logDraftDepartures reports an accepted ID-JAG that departs from the draft.
+// It changes nothing about what is accepted. The first occurrence of each
+// (assertion issuer, finding) pair is logged at Warn and later ones at Debug.
+// The lines carry no subject, jti or claim values.
+func (h *IDJAGHandler) logDraftDepartures(ctx context.Context, claims *ValidatedClaims, clientID, resource string) {
+	var found []draftDeparture
+	if len(claims.Audience) > 1 {
+		found = append(found, departureMultipleAudiences)
+	}
+	if issuer := h.issuer.GetAccessTokenIssuer(ctx); issuer != "" && !slices.Contains(claims.Audience, issuer) {
+		found = append(found, departureAudienceNotIssuer)
+	}
+	claimed := idjag.ResourceClaim(claims.Extra["resource"])
+	if resource != "" && len(claimed) > 0 && !slices.Contains(claimed, resource) {
+		found = append(found, departureResourceNotCovered)
+	}
+	if len(found) == 0 {
+		return
+	}
+	logger := h.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	for _, finding := range found {
+		level := slog.LevelDebug
+		if _, seen := h.warned.LoadOrStore([2]string{claims.Issuer, string(finding)}, struct{}{}); !seen {
+			level = slog.LevelWarn
+		}
+		logger.Log(ctx, level, "ID-JAG departs from the draft; accepted for compatibility",
+			"issuer", claims.Issuer, "client_id", clientID, "finding", string(finding))
+	}
 }
 
 // checkClientGrant refuses an explicit-grant client whose registered grant types

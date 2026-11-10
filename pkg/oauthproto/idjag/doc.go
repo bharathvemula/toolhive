@@ -24,7 +24,7 @@
 // ID-JAG rules. An ID-JAG is a JWT-bearer assertion profile that is obtained
 // through a token exchange. The redemption is not itself a token exchange.
 //
-// This package holds three functions:
+// This package holds four functions:
 //
 //   - [IsIDJAG] is the typ test. Every access-token validator that shares a
 //     signing key with an ID-JAG issuer must call it, so an ID-JAG is never
@@ -40,11 +40,17 @@
 //   - [Verify] is the resource server's check that an ID-JAG is addressed to
 //     the client that presents it. It checks that the jti and client_id claims
 //     are present and that client_id names the client (draft 3.1, 4.4.1).
+//   - [ResourceClaim] reads the string-or-array resource claim (draft 3.1).
+//     [FromExchange] and the auth server's departure log both use it.
 //
 // Verify is only the part of draft 4.4.1 that ties an ID-JAG to the client
 // presenting it. The rules about the audience and the resource claim in 4.4.1
-// are not part of it. Signature checks, issuer trust, replay protection and
-// client authentication remain product concerns. This package never does them.
+// are not part of it. The auth server does not enforce those rules. It logs
+// at WARN the first time per issuer and finding, then at DEBUG, when it
+// accepts an ID-JAG that departs from them
+// (see pkg/authserver/server/tokenexchange/id_jag_handler.go). Signature
+// checks, issuer trust, replay protection and client authentication remain
+// product concerns. This package never does them.
 //
 // The wiring lives in pkg/vmcp/auth/strategies/xaa.go (the client) and in
 // pkg/authserver/server/tokenexchange (the authorization server).
