@@ -5,6 +5,7 @@ package tokenexchange
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/oauthproto"
+	"github.com/stacklok/toolhive/pkg/oauthproto/idjag"
 )
 
 // idJAGReplayPurpose namespaces ID-JAG replay keys apart from plain
@@ -134,14 +136,7 @@ func (h *IDJAGHandler) HandleTokenEndpointRequest(ctx context.Context, requester
 	if h.core.consumer == nil {
 		return errorsx.WithStack(fosite.ErrServerError.WithHint("The JWT-bearer grant is not fully configured."))
 	}
-	// Unlike a plain RFC 7523 assertion (where many IdPs omit jti and the
-	// replay key falls back to an assertion hash), the ID-JAG draft requires
-	// jti, and it is what makes the assertion single-use. Absence means the
-	// token is not a conforming ID-JAG; reject rather than fall back.
-	if claims.JWTID == "" {
-		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The ID-JAG assertion must carry a 'jti' claim."))
-	}
-	if err := h.checkClientBinding(requester, claims); err != nil {
+	if err := checkIDJAG(requester, claims); err != nil {
 		return err
 	}
 	resource, err := validateJWTBearerPolicy(requester.GetRequestForm(), claims, policy)
@@ -211,25 +206,38 @@ func (h *IDJAGHandler) checkClientGrant(requester fosite.AccessRequester) error 
 	return nil
 }
 
-// checkClientBinding enforces the draft's §4.4.1 client_id continuity: the
-// assertion's client_id claim (minted by the IdP from its resource
-// connection) must name the client fosite resolved for this request. Both
-// sides are required to be non-empty first so the check can never
-// degenerate into an empty-equals-empty pass — fosite initializes an
-// unauthenticated request's client to an ID-less placeholder, and this
-// handler must not depend on that staying unreachable.
-func (*IDJAGHandler) checkClientBinding(requester fosite.AccessRequester, claims *ValidatedClaims) error {
-	if claims.ClientID == "" {
+// checkIDJAG applies idjag.Verify and maps its result to fosite errors.
+//
+// Unlike a plain RFC 7523 assertion, whose jti may be absent (the replay key
+// then falls back to an assertion hash), an ID-JAG requires jti, and it is
+// what makes the assertion single-use. The binding fails closed on an empty
+// client: fosite initializes an unauthenticated request's client to an
+// ID-less placeholder, and an empty client_id must never match it.
+func checkIDJAG(requester fosite.AccessRequester, claims *ValidatedClaims) error {
+	var clientID string
+	if client := requester.GetClient(); client != nil {
+		clientID = client.GetID()
+	}
+	err := idjag.Verify(
+		idjag.Presented{JWTID: claims.JWTID, ClientID: claims.ClientID},
+		idjag.Expected{ClientID: clientID},
+	)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, idjag.ErrMissingJWTID):
+		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The ID-JAG assertion must carry a 'jti' claim."))
+	case errors.Is(err, idjag.ErrMissingClientID):
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The ID-JAG assertion must carry a 'client_id' claim."))
+	case errors.Is(err, idjag.ErrNoClient):
+		return errorsx.WithStack(fosite.ErrInvalidClient.WithHint(
+			"The ID-JAG grant requires an authenticated or identified client."))
+	case errors.Is(err, idjag.ErrClientMismatch):
+		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint(
+			"The ID-JAG assertion was not issued to the requesting client."))
+	default:
+		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The ID-JAG assertion is not valid for this client."))
 	}
-	client := requester.GetClient()
-	if client == nil || client.GetID() == "" {
-		return errorsx.WithStack(fosite.ErrInvalidClient.WithHint("The ID-JAG grant requires an authenticated or identified client."))
-	}
-	if claims.ClientID != client.GetID() {
-		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The ID-JAG assertion was not issued to the requesting client."))
-	}
-	return nil
 }
 
 // IDJAGIssuanceFactory builds the production bound ID-JAG handler. It is

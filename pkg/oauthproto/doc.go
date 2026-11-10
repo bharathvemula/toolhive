@@ -21,8 +21,9 @@
 //     token types it exchanges.
 //   - oauthproto/jwtbearer: the RFC 7523 JWT-bearer client.
 //   - oauthproto/idjag: Cross App Access (ID-JAG). Start at its doc.go.
-//     FromExchange is the client's check of an IdP response. IsIDJAG is the
-//     deny-side typ test.
+//     FromExchange is the client's check of an IdP response. Verify is the
+//     server's check that an ID-JAG is addressed to the client that presents
+//     it. IsIDJAG is the deny-side typ test.
 //
 // Leaf-package invariant: this package has no dependency on
 // github.com/stacklok/toolhive/pkg/networking. All callers that need both

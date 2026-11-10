@@ -171,6 +171,7 @@ func TestIDJAGHandler_ClientBindingAndJTI(t *testing.T) {
 		mutateClaims   func(*ValidatedClaims)
 		requestClient  string
 		wantErrIs      error
+		wantReason     string
 		wantErrContain string
 	}{
 		{
@@ -185,6 +186,27 @@ func TestIDJAGHandler_ClientBindingAndJTI(t *testing.T) {
 			mutateClaims:   func(c *ValidatedClaims) { c.ClientID = "" },
 			requestClient:  idJAGTestClientID,
 			wantErrIs:      fosite.ErrInvalidGrant,
+			wantErrContain: "'client_id'",
+		},
+		{
+			name:           "missing jti and client_id reports jti first",
+			mutateClaims:   func(c *ValidatedClaims) { c.JWTID, c.ClientID = "", "" },
+			requestClient:  idJAGTestClientID,
+			wantErrIs:      fosite.ErrInvalidGrant,
+			wantReason:     "The ID-JAG assertion must carry a 'jti' claim.",
+			wantErrContain: "'jti'",
+		},
+		{
+			name:           "missing jti with no client reports jti before invalid_client",
+			mutateClaims:   func(c *ValidatedClaims) { c.JWTID = "" },
+			wantErrIs:      fosite.ErrInvalidGrant,
+			wantErrContain: "'jti'",
+		},
+		{
+			name:           "missing client_id with no client reports client_id before invalid_client",
+			mutateClaims:   func(c *ValidatedClaims) { c.ClientID = "" },
+			wantErrIs:      fosite.ErrInvalidGrant,
+			wantReason:     "The ID-JAG assertion must carry a 'client_id' claim.",
 			wantErrContain: "'client_id'",
 		},
 		{
@@ -220,6 +242,9 @@ func TestIDJAGHandler_ClientBindingAndJTI(t *testing.T) {
 			var rfcErr *fosite.RFC6749Error
 			require.True(t, errors.As(err, &rfcErr))
 			assert.Contains(t, rfcErr.Reason(), tt.wantErrContain)
+			if tt.wantReason != "" {
+				assert.Equal(t, tt.wantReason, rfcErr.Reason())
+			}
 			// None of these rejections may consume the assertion: they are all
 			// caller-fixable, and a consumed jti would turn a retry with the
 			// right client into a replay rejection.
